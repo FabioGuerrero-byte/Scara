@@ -1,0 +1,266 @@
+// =====================================================================
+// CONTROL DE POSICIÓN ANGULAR PARA 2 MOTORES DC CON ENCODER (ESP32)
+// -----------------------------------------------------------------
+// Este código NO controla velocidad directamente: controla el ÁNGULO
+// (posición) de cada motor. La velocidad se calcula solo como paso
+// intermedio para, mediante integración numérica, estimar el ángulo
+// (funciona como un "encoder virtual" acumulado).
+// El controlador es una ecuación en diferencias (función de
+// transferencia discreta, coeficientes num/den) que actúa como ley
+// de control tipo PID, con saturación de la salida en ±12 (voltios).
+// =====================================================================
+
+// ---------------- MOTOR 1 ----------------
+#define pinA1      26 // Pin del canal A del encoder del motor 1
+#define pinB1      25 // Pin del canal B del encoder del motor 1
+#define in1_1      27 // Salida PWM al driver (sentido 1) del motor 1
+#define in2_1      33 // Salida PWM al driver (sentido 2) del motor 1
+
+// ---------------- MOTOR 2 ----------------
+#define pinA2      14 // Pin del canal A del encoder del motor 2
+#define pinB2      12 // Pin del canal B del encoder del motor 2
+#define in1_2      32 // Salida PWM al driver (sentido 1) del motor 2
+#define in2_2      13 // Salida PWM al driver (sentido 2) del motor 2
+
+// ---------------- CONFIG ----------------
+float tm = 0.01;   // Periodo de muestreo del lazo de control (10 ms)
+int m = (255) / (12.33); // Factor de escala para convertir "voltaje deseado" (salida del
+                          // controlador, en voltios) a valor PWM de 0-255, asumiendo
+                          // que la fuente entrega ~12.33 V máximo al puente H.
+
+// ---------------- MOTOR 1 VARS ----------------
+volatile long pulsos1 = 0;              // Contador de pulsos del encoder (se modifica en la ISR)
+volatile bool ultimoA1 = LOW,           // Último estado leído del canal A (para detectar flancos)
+              ultimoB1 = LOW,           // Último estado leído del canal B
+              direccion1 = true;        // (Declarada pero no usada actualmente)
+long pulsosAnterior1 = 0;               // Pulsos acumulados en el cálculo de velocidad anterior
+float velocidadRadS1 = 0.0;             // Velocidad angular estimada del motor 1 [rad/s]
+float angulo1 = 0.0;                    // Posición angular estimada del motor 1 [rad] (integrando la velocidad)
+
+// ---------------- MOTOR 2 VARS ----------------
+volatile long pulsos2 = 0;              // Contador de pulsos del encoder del motor 2
+volatile bool ultimoA2 = LOW,
+              ultimoB2 = LOW,
+              direccion2 = true;
+long pulsosAnterior2 = 0;
+float velocidadRadS2 = 0.0;             // Velocidad angular estimada del motor 2 [rad/s]
+float angulo2 = 0.0;                    // Posición angular estimada del motor 2 [rad]
+
+// ---------------- PID PARAMS ----------------
+// Coeficientes de una función de transferencia discreta C(z) = num(z)/den(z)
+// que actúa como controlador (equivalente a un PID diseñado y discretizado).
+float num[3] = {-412.7971, 784.29, -372.4525}; // Coeficientes del numerador (parte del error)
+float den[3] = {1, -0.6027, -0.3973};          // Coeficientes del denominador (parte recursiva de la salida)
+
+// Estado interno (memoria) del controlador del motor 1:
+// err1: error actual [0] y los dos anteriores [1],[2]
+// co1:  salida de control actual [0] y las dos anteriores [1],[2]
+float err1[3] = {0,0,0};
+float co1[3]  = {0,0,0};
+
+// Estado interno (memoria) del controlador del motor 2
+float err2[3] = {0,0,0};
+float co2[3]  = {0,0,0};
+
+// ---------------- VELOCIDAD ----------------
+const int CPR = 17;                     // Pulsos por revolución del encoder (antes de multiplicar por reducción)
+const unsigned long intervaloCalculo = 10; // Cada cuánto (ms) se recalcula la velocidad
+unsigned long tiempoAnterior = 0;       // Marca de tiempo del último cálculo de velocidad
+
+// ---------------- FUNCIONES ----------------
+
+// Aplica la señal de control "in" (voltaje deseado, ±12V) al motor 1.
+// Según el signo, activa un sentido de giro u otro mediante PWM en in1_1/in2_1.
+void motor1(float in){
+  if(in<=0){
+    analogWrite(in2_1, -in*m); // Gira en un sentido (magnitud escalada a PWM)
+    analogWrite(in1_1, 0);
+  }else{
+    analogWrite(in1_1, in*m);  // Gira en el sentido contrario
+    analogWrite(in2_1, 0);
+  }
+}
+
+// Igual que motor1() pero para el motor 2.
+void motor2(float in){
+  if(in<=0){
+    analogWrite(in2_2, -in*m);
+    analogWrite(in1_2, 0);
+  }else{
+    analogWrite(in1_2, in*m);
+    analogWrite(in2_2, 0);
+  }
+}
+
+// Controlador digital genérico (implementa la ecuación en diferencias de
+// una función de transferencia discreta num/den). Actúa como ley de control:
+//   y  = variable medida (realimentación) -> aquí SIEMPRE es el ÁNGULO, no la velocidad
+//   u  = referencia/setpoint deseado (ref1 o ref2)
+//   sat = límite de saturación de la salida (±12 V)
+// Devuelve la señal de control (voltaje) a aplicar al motor.
+float PID(float* num2, float* den2, float* co, float* err, float y, float u, float sat) {
+  // Desplaza el historial de errores (shift): err[0] pasa a err[1], err[1] a err[2]
+  err[2] = err[1];
+  err[1] = err[0];
+  err[0] = u - y;              // Error actual = referencia - posición medida (angulo)
+
+  // Desplaza el historial de salidas de control
+  co[2] = co[1];
+  co[1] = co[0];
+
+  // Ecuación en diferencias: nueva salida en función del error actual/pasado
+  // y de las salidas anteriores (parte recursiva -> memoria del controlador)
+  co[0] = err[0]*num2[0] + err[1]*num2[1] + err[2]*num2[2]
+        - co[1]*den2[1] - co[2]*den2[2];
+
+  // Saturación de la señal de control para no exceder el voltaje disponible
+  if (co[0] >= sat) co[0] = sat;
+  else if (co[0] <= -sat) co[0] = -sat;
+
+  return co[0];
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);   // Comunicación serial para recibir referencias y enviar datos
+  Serial.setTimeout(1);   // Timeout corto de lectura para no bloquear el loop
+
+  // --- Configuración Motor 1 ---
+  pinMode(in1_1, OUTPUT); analogWrite(in1_1, 0); // Pines de salida al driver, inician en 0
+  pinMode(in2_1, OUTPUT); analogWrite(in2_1, 0);
+  pinMode(pinA1, INPUT_PULLUP);                  // Entradas del encoder con pull-up interno
+  pinMode(pinB1, INPUT_PULLUP);
+  ultimoA1 = digitalRead(pinA1);                 // Lee el estado inicial del encoder
+  ultimoB1 = digitalRead(pinB1);
+  // Interrupciones en ambos canales para no perder ningún flanco (cuadratura completa)
+  attachInterrupt(digitalPinToInterrupt(pinA1), leerEncoder1, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(pinB1), leerEncoder1, CHANGE);
+
+  // --- Configuración Motor 2 (análogo al motor 1) ---
+  pinMode(in1_2, OUTPUT); analogWrite(in1_2, 0);
+  pinMode(in2_2, OUTPUT); analogWrite(in2_2, 0);
+  pinMode(pinA2, INPUT_PULLUP);
+  pinMode(pinB2, INPUT_PULLUP);
+  ultimoA2 = digitalRead(pinA2);
+  ultimoB2 = digitalRead(pinB2);
+  attachInterrupt(digitalPinToInterrupt(pinA2), leerEncoder2, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(pinB2), leerEncoder2, CHANGE);
+}
+
+// ---------------- LOOP ----------------
+String rec="0,0";              // Buffer de la cadena recibida por serial, formato "ref1,ref2"
+float vel_ant1=0, vel_ant2=0;  // Velocidad del ciclo anterior (para integración trapezoidal)
+float ref1=0, ref2=0;          // Referencias (ángulos deseados) para motor 1 y motor 2
+
+void loop() {
+  unsigned long tiempoActual = millis();
+
+  // Cada "intervaloCalculo" ms, recalcula la velocidad angular de ambos motores
+  // a partir de los pulsos acumulados del encoder
+  if (tiempoActual - tiempoAnterior >= intervaloCalculo) {
+    calcularVelocidad1();
+    calcularVelocidad2();
+    tiempoAnterior = tiempoActual;
+  }
+
+  // Si llegan datos por serial, se interpretan como "ref1,ref2"
+  // (las referencias/ángulos deseados para cada motor)
+  if(Serial.available()){
+    rec = Serial.readString();
+    int coma = rec.indexOf(',');
+    if(coma>0){
+      ref1 = rec.substring(0,coma).toFloat();
+      ref2 = rec.substring(coma+1).toFloat();
+    }
+  }
+
+  // --- Lazo de control motor 1: compara angulo1 (medido/estimado) contra ref1 ---
+  float u1 = PID(num,den,co1,err1,angulo1,ref1,12);
+  motor1(u1); // Aplica el voltaje de control resultante al motor 1
+
+  // --- Lazo de control motor 2: compara angulo2 contra ref2 ---
+  float u2 = PID(num,den,co2,err2,angulo2,ref2,12);
+  motor2(u2);
+
+  // Integración trapezoidal de la velocidad para estimar el ángulo actual
+  // angulo(k) = angulo(k-1) + (v(k)+v(k-1))/2 * tm
+  angulo1 += (velocidadRadS1+vel_ant1)*tm/2;
+  vel_ant1 = velocidadRadS1;
+
+  angulo2 += (velocidadRadS2+vel_ant2)*tm/2;
+  vel_ant2 = velocidadRadS2;
+
+  // Envío de datos por serial para monitoreo/graficación:
+  // referencia y ángulo real de cada motor
+  Serial.print(ref1); Serial.print(";"); Serial.print(angulo1);
+  Serial.print(" | ");
+  Serial.print(ref2); Serial.print(";"); Serial.println(angulo2);
+
+  delay(tm*1000); // Espera para completar el periodo de muestreo (10 ms)
+}
+
+// ---------------- INTERRUPCIONES ----------------
+// Decodificación de cuadratura del encoder del motor 1: por cada flanco
+// (subida o bajada) en A o en B, determina el sentido de giro y
+// incrementa/decrementa el contador de pulsos.
+void leerEncoder1() {
+  bool estadoA = digitalRead(pinA1);
+  bool estadoB = digitalRead(pinB1);
+  if (estadoA != ultimoA1) { // Hubo flanco en el canal A
+    if (estadoA == HIGH) { if (estadoB == LOW) pulsos1++; else pulsos1--; }
+    else { if (estadoB == HIGH) pulsos1++; else pulsos1--; }
+  }
+  if (estadoB != ultimoB1) { // Hubo flanco en el canal B
+    if (estadoB == HIGH) { if (estadoA == HIGH) pulsos1++; else pulsos1--; }
+    else { if (estadoA == LOW) pulsos1++; else pulsos1--; }
+  }
+  ultimoA1 = estadoA; ultimoB1 = estadoB; // Actualiza el último estado leído
+}
+
+// Igual que leerEncoder1() pero para el encoder del motor 2.
+void leerEncoder2() {
+  bool estadoA = digitalRead(pinA2);
+  bool estadoB = digitalRead(pinB2);
+  if (estadoA != ultimoA2) {
+    if (estadoA == HIGH) { if (estadoB == LOW) pulsos2++; else pulsos2--; }
+    else { if (estadoB == HIGH) pulsos2++; else pulsos2--; }
+  }
+  if (estadoB != ultimoB2) {
+    if (estadoB == HIGH) { if (estadoA == HIGH) pulsos2++; else pulsos2--; }
+    else { if (estadoA == LOW) pulsos2++; else pulsos2--; }
+  }
+  ultimoA2 = estadoA; ultimoB2 = estadoB;
+}
+
+// ---------------- VELOCIDADES ----------------
+// Calcula la velocidad angular del motor 1 a partir del cambio de pulsos
+// del encoder en el último "intervaloCalculo" (ms).
+void calcularVelocidad1() {
+  noInterrupts();                 // Protege la lectura de "pulsos1" (variable compartida con la ISR)
+  long pulsosActual = pulsos1;
+  interrupts();
+
+
+  long deltaPulsos = pulsosActual - pulsosAnterior1;   // Pulsos acumulados en este intervalo
+  float deltaTime = intervaloCalculo / 1000.0;         // Intervalo en segundos
+
+  // CPR*119 -> pulsos por revolución del encoder multiplicados por la
+  // relación de reducción del motorreductor (119:1), para obtener RPM en el eje de salida
+  float velocidadRPM = (deltaPulsos / ((float)CPR*119)) * (60.0 / deltaTime);
+  velocidadRadS1 = velocidadRPM * (2.0 * PI / 60.0);   // Conversión de RPM a rad/s
+
+  pulsosAnterior1 = pulsosActual; // Guarda el conteo actual para el próximo cálculo
+}
+
+// Igual que calcularVelocidad1() pero para el motor 2.
+void calcularVelocidad2() {
+  noInterrupts();
+  long pulsosActual = pulsos2;
+  interrupts();
+
+  long deltaPulsos = pulsosActual - pulsosAnterior2;
+  float deltaTime = intervaloCalculo / 1000.0;
+  float velocidadRPM = (deltaPulsos / ((float)CPR*119)) * (60.0 / deltaTime);
+  velocidadRadS2 = velocidadRPM * (2.0 * PI / 60.0);
+  pulsosAnterior2 = pulsosActual;
+}
