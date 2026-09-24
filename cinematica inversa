@@ -1,0 +1,120 @@
+function angulos = cinematica_inversa(T_deseada)
+% CINEMATICA_INVERSA  Calcula los 6 ángulos de junta (theta1..theta6) de
+% un robot de 6 grados de libertad con muñeca esférica, a partir de la
+% matriz de transformación homogénea deseada del efector final.
+%
+% ENTRADA:
+%   T_deseada -> matriz de transformación homogénea 4x4 (base -> efector)
+%
+% SALIDA:
+%   angulos   -> vector [th1 th2 th3 th4 th5 th6] en RADIANES
+%                (en consola se muestran también en grados)
+%
+% Nota: se usa "theta3_falso" como variable intermedia porque el ángulo
+% que sale directo de la geometría del triángulo (a2, a3*, d) no es el
+% mismo theta3 de la tabla DH: hay que corregirlo restando pi/2 y el
+% ángulo phi (por el desfase entre a3 y d4). Igual que en el original.
+
+    if nargin < 1 || isempty(T_deseada)
+        % Matriz de ejemplo (la del enunciado), por si se llama sin argumento
+        T_deseada = [-0.7472, -0.4714,  0.4684, 623.9068; ...
+                      0.6459, -0.3495,  0.6787, 392.8726; ...
+                     -0.1562,  0.8097,  0.5657, 913.1507; ...
+                      0,       0,       0,      1.0000];
+        warning('No se recibió matriz T. Se usará la matriz de ejemplo del enunciado.');
+    end
+
+    % --- 1. Parámetros geométricos del robot (mm) ---
+    d1 = 330;
+    a1 = 79;
+    a2 = 445;
+    a3 = 40;
+    d4 = 440;
+    d6 = 80;
+
+    a3_estrella = sqrt(a3^2 + d4^2);   % Longitud "virtual" del eslabón 3-4
+    phi         = atan(a3 / d4);       % Ángulo de corrección por el desfase a3/d4
+
+    % --- 2. Separar rotación y posición de la matriz deseada ---
+    R_total = T_deseada(1:3, 1:3);     % Orientación deseada del efector
+    P       = T_deseada(1:3, 4);       % Posición deseada del efector
+    Z_eje   = R_total(:, 3);           % Eje Z del efector (aproximación/orientación)
+
+    % --- 3. Ubicar el centro de la muñeca esférica (punto W) ---
+    % Se retrocede desde el efector una distancia d6 a lo largo del eje Z
+    W = P - d6 * Z_eje;
+
+    % ==================== CINEMÁTICA INVERSA DE POSICIÓN ====================
+
+    % --- theta1: ángulo de la base, vista desde arriba (plano XY) ---
+    theta1 = atan2(W(2), W(1));
+
+    % --- Proyección de W sobre el plano XY (para el triángulo 2D) ---
+    Wxy = sqrt(W(1)^2 + W(2)^2);
+
+    % --- Triángulo formado por a1, a2 y a3* para hallar theta2 y theta3 ---
+    alpha_ang = atan2((W(3) - d1), (Wxy - a1));          % Ángulo de elevación hacia W
+    d_diag    = sqrt((Wxy - a1)^2 + (W(3) - d1)^2);       % Distancia hombro-muñeca
+
+    beta_ang  = acos(-((a3_estrella^2 - a2^2 - d_diag^2) / (2 * a2 * d_diag)));
+    theta2    = alpha_ang + beta_ang;
+
+    gamma_ang    = acos(-((d_diag^2 - a2^2 - a3_estrella^2) / (2 * a2 * a3_estrella)));
+    theta3_falso = -(pi - gamma_ang);      % Ángulo "crudo" del triángulo
+    theta3       = theta3_falso - (pi/2) - phi;   % Corrección al theta3 real (DH)
+
+    % ==================== CINEMÁTICA INVERSA DE ORIENTACIÓN ====================
+
+    % --- Transformación acumulada de los primeros 3 eslabones (base -> muñeca) ---
+    A1 = matriz_DH(theta1,               d1, pi/2, a1);
+    A2 = matriz_DH(theta2,               0,  0,    a2);
+    A3 = matriz_DH(theta3 + pi/2 + phi,  0,  pi/2, a3_estrella);
+
+    T3_0 = A1 * A2 * A3;
+    R3_0 = T3_0(1:3, 1:3);
+
+    % --- Rotación que deben aportar los eslabones 4, 5 y 6 (muñeca esférica) ---
+    R6_3 = R3_0' * R_total;
+
+    % --- Extraer theta4, theta5, theta6 de la matriz de rotación R6_3 ---
+    r13 = R6_3(1, 3);
+    r23 = R6_3(2, 3);
+    r33 = R6_3(3, 3);
+    r31 = R6_3(3, 1);
+    r32 = R6_3(3, 2);
+
+    theta5 = atan2(sqrt(r13^2 + r23^2), r33);
+    theta4 = atan2(r23, r13);
+    theta6 = atan2(r32, -r31);
+
+    % --- 4. Empaquetar salida y mostrar resultados ---
+    angulos = [theta1, theta2, theta3, theta4, theta5, theta6];
+    imprimir_resultados(theta1, theta2, theta3_falso, theta3, theta4, theta5, theta6);
+
+end
+
+
+function A = matriz_DH(theta, d, alpha, a)
+% MATRIZ_DH  Construye la matriz de transformación homogénea (4x4)
+% de un eslabón a partir de sus 4 parámetros de Denavit-Hartenberg.
+
+    A = [ cos(theta), -sin(theta)*cos(alpha),  sin(theta)*sin(alpha), a*cos(theta); ...
+          sin(theta),  cos(theta)*cos(alpha), -cos(theta)*sin(alpha), a*sin(theta); ...
+                   0,             sin(alpha),             cos(alpha),            d; ...
+                   0,                      0,                      0,            1 ];
+end
+
+
+function imprimir_resultados(th1, th2, th3_falso, th3, th4, th5, th6)
+% IMPRIMIR_RESULTADOS  Muestra en consola los 6 ángulos de junta,
+% en radianes y en grados, con el mismo formato del código original.
+
+    fprintf('--- RESULTADOS ---\n');
+    fprintf('theta1 = %.4f rad (%.2f deg)\n', th1,       rad2deg(th1));
+    fprintf('theta2 = %.4f rad (%.2f deg)\n', th2,       rad2deg(th2));
+    fprintf('theta3_falso = %.4f rad (%.2f deg)\n', th3_falso, rad2deg(th3_falso));
+    fprintf('theta3 = %.4f rad (%.2f deg)\n', th3,       rad2deg(th3));
+    fprintf('theta4 = %.4f rad (%.2f deg)\n', th4,       rad2deg(th4));
+    fprintf('theta5 = %.4f rad (%.2f deg)\n', th5,       rad2deg(th5));
+    fprintf('theta6 = %.4f rad (%.2f deg)\n', th6,       rad2deg(th6));
+end
