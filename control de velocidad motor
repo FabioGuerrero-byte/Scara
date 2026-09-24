@@ -1,0 +1,554 @@
+// =====================================================================
+// CONTROL DE VELOCIDAD PARA 2 MOTORES DC CON ENCODER - ESP32
+// ---------------------------------------------------------------------
+// Control PI de velocidad.
+// Referencia recibida por Serial: "RPM1,RPM2"
+// Ejemplo: 100,100
+//
+// Motor 1:
+// Encoder A -> GPIO 26
+// Encoder B -> GPIO 25
+// Driver IN1 -> GPIO 27
+// Driver IN2 -> GPIO 33
+//
+// Motor 2:
+// Encoder A -> GPIO 14
+// Encoder B -> GPIO 12
+// Driver IN1 -> GPIO 32
+// Driver IN2 -> GPIO 13
+// =====================================================================
+
+
+// ---------------- MOTOR 1 ----------------
+#define pinA1 26
+#define pinB1 25
+
+#define in1_1 27
+#define in2_1 33
+
+
+// ---------------- MOTOR 2 ----------------
+#define pinA2 14
+#define pinB2 12
+
+#define in1_2 32
+#define in2_2 13
+
+
+// ---------------- CONFIGURACION ----------------
+
+float tm = 0.01;              // Tiempo de muestreo = 10 ms
+
+const float VMAX = 12.0;      // Voltaje máximo aplicado al motor
+
+// Conversión aproximada de voltaje a PWM
+float PWM_FACTOR = 255.0 / 12.33;
+
+
+// ---------------- ENCODER ----------------
+
+const int CPR = 17;           // Pulsos por revolución
+const int REDUCCION = 119;    // Relación del motorreductor
+
+const unsigned long intervaloCalculo = 10;
+
+
+// ---------------- MOTOR 1 ----------------
+
+volatile long pulsos1 = 0;
+
+volatile bool ultimoA1 = LOW;
+volatile bool ultimoB1 = LOW;
+
+long pulsosAnterior1 = 0;
+
+float velocidadRPM1 = 0.0;
+
+
+// ---------------- MOTOR 2 ----------------
+
+volatile long pulsos2 = 0;
+
+volatile bool ultimoA2 = LOW;
+volatile bool ultimoB2 = LOW;
+
+long pulsosAnterior2 = 0;
+
+float velocidadRPM2 = 0.0;
+
+
+// ---------------- REFERENCIAS ----------------
+
+float ref1 = 0.0;
+float ref2 = 0.0;
+
+
+// =====================================================================
+// CONTROL PI MOTOR 1
+// =====================================================================
+
+float errorAnterior1 = 0.0;
+float integral1 = 0.0;
+
+float Kp1 = 0.08;
+float Ki1 = 0.80;
+
+
+// =====================================================================
+// CONTROL PI MOTOR 2
+// =====================================================================
+
+float errorAnterior2 = 0.0;
+float integral2 = 0.0;
+
+float Kp2 = 0.08;
+float Ki2 = 0.80;
+
+
+// =====================================================================
+// FUNCION PARA CONTROLAR MOTOR 1
+// =====================================================================
+
+void motor1(float voltaje)
+{
+  if (voltaje > VMAX)
+    voltaje = VMAX;
+
+  if (voltaje < -VMAX)
+    voltaje = -VMAX;
+
+  int pwm = abs(voltaje * PWM_FACTOR);
+
+  if (pwm > 255)
+    pwm = 255;
+
+
+  if (voltaje >= 0)
+  {
+    analogWrite(in1_1, pwm);
+    analogWrite(in2_1, 0);
+  }
+  else
+  {
+    analogWrite(in1_1, 0);
+    analogWrite(in2_1, pwm);
+  }
+}
+
+
+// =====================================================================
+// FUNCION PARA CONTROLAR MOTOR 2
+// =====================================================================
+
+void motor2(float voltaje)
+{
+  if (voltaje > VMAX)
+    voltaje = VMAX;
+
+  if (voltaje < -VMAX)
+    voltaje = -VMAX;
+
+  int pwm = abs(voltaje * PWM_FACTOR);
+
+  if (pwm > 255)
+    pwm = 255;
+
+
+  if (voltaje >= 0)
+  {
+    analogWrite(in1_2, pwm);
+    analogWrite(in2_2, 0);
+  }
+  else
+  {
+    analogWrite(in1_2, 0);
+    analogWrite(in2_2, pwm);
+  }
+}
+
+
+// =====================================================================
+// CONTROL PI MOTOR 1
+// =====================================================================
+
+float PI_Motor1(float referencia, float velocidad)
+{
+  float error = referencia - velocidad;
+
+  // Integración del error
+  integral1 += error * tm;
+
+  // Anti-windup
+  if (integral1 > 20)
+    integral1 = 20;
+
+  if (integral1 < -20)
+    integral1 = -20;
+
+  // Control PI
+  float salida = Kp1 * error + Ki1 * integral1;
+
+  // Saturación
+  if (salida > VMAX)
+    salida = VMAX;
+
+  if (salida < -VMAX)
+    salida = -VMAX;
+
+  return salida;
+}
+
+
+// =====================================================================
+// CONTROL PI MOTOR 2
+// =====================================================================
+
+float PI_Motor2(float referencia, float velocidad)
+{
+  float error = referencia - velocidad;
+
+  // Integración del error
+  integral2 += error * tm;
+
+  // Anti-windup
+  if (integral2 > 20)
+    integral2 = 20;
+
+  if (integral2 < -20)
+    integral2 = -20;
+
+  // Control PI
+  float salida = Kp2 * error + Ki2 * integral2;
+
+  // Saturación
+  if (salida > VMAX)
+    salida = VMAX;
+
+  if (salida < -VMAX)
+    salida = -VMAX;
+
+  return salida;
+}
+
+
+// =====================================================================
+// SETUP
+// =====================================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  Serial.setTimeout(1);
+
+
+  // ---------------- MOTOR 1 ----------------
+
+  pinMode(in1_1, OUTPUT);
+  pinMode(in2_1, OUTPUT);
+
+  analogWrite(in1_1, 0);
+  analogWrite(in2_1, 0);
+
+  pinMode(pinA1, INPUT_PULLUP);
+  pinMode(pinB1, INPUT_PULLUP);
+
+  ultimoA1 = digitalRead(pinA1);
+  ultimoB1 = digitalRead(pinB1);
+
+  attachInterrupt(
+    digitalPinToInterrupt(pinA1),
+    leerEncoder1,
+    CHANGE
+  );
+
+  attachInterrupt(
+    digitalPinToInterrupt(pinB1),
+    leerEncoder1,
+    CHANGE
+  );
+
+
+  // ---------------- MOTOR 2 ----------------
+
+  pinMode(in1_2, OUTPUT);
+  pinMode(in2_2, OUTPUT);
+
+  analogWrite(in1_2, 0);
+  analogWrite(in2_2, 0);
+
+  pinMode(pinA2, INPUT_PULLUP);
+  pinMode(pinB2, INPUT_PULLUP);
+
+  ultimoA2 = digitalRead(pinA2);
+  ultimoB2 = digitalRead(pinB2);
+
+  attachInterrupt(
+    digitalPinToInterrupt(pinA2),
+    leerEncoder2,
+    CHANGE
+  );
+
+  attachInterrupt(
+    digitalPinToInterrupt(pinB2),
+    leerEncoder2,
+    CHANGE
+  );
+}
+
+
+// =====================================================================
+// LOOP
+// =====================================================================
+
+String rec = "0,0";
+
+unsigned long tiempoAnterior = 0;
+
+
+void loop()
+{
+  unsigned long tiempoActual = millis();
+
+
+  // -------------------------------------------------
+  // CALCULAR VELOCIDAD
+  // -------------------------------------------------
+
+  if (tiempoActual - tiempoAnterior >= intervaloCalculo)
+  {
+    calcularVelocidad1();
+    calcularVelocidad2();
+
+    tiempoAnterior = tiempoActual;
+  }
+
+
+  // -------------------------------------------------
+  // RECIBIR REFERENCIAS
+  // -------------------------------------------------
+
+  if (Serial.available())
+  {
+    rec = Serial.readString();
+
+    int coma = rec.indexOf(',');
+
+    if (coma > 0)
+    {
+      ref1 = rec.substring(0, coma).toFloat();
+
+      ref2 = rec.substring(coma + 1).toFloat();
+    }
+  }
+
+
+  // -------------------------------------------------
+  // CONTROL PI
+  // -------------------------------------------------
+
+  float u1 = PI_Motor1(ref1, velocidadRPM1);
+
+  float u2 = PI_Motor2(ref2, velocidadRPM2);
+
+
+  // -------------------------------------------------
+  // APLICAR CONTROL
+  // -------------------------------------------------
+
+  motor1(u1);
+
+  motor2(u2);
+
+
+  // -------------------------------------------------
+  // MONITOREO SERIAL
+  // -------------------------------------------------
+
+  Serial.print(ref1);
+  Serial.print(";");
+  Serial.print(velocidadRPM1);
+
+  Serial.print(" | ");
+
+  Serial.print(ref2);
+  Serial.print(";");
+  Serial.println(velocidadRPM2);
+
+
+  delay(10);
+}
+
+
+// =====================================================================
+// ENCODER MOTOR 1
+// =====================================================================
+
+void leerEncoder1()
+{
+  bool estadoA = digitalRead(pinA1);
+  bool estadoB = digitalRead(pinB1);
+
+
+  if (estadoA != ultimoA1)
+  {
+    if (estadoA == HIGH)
+    {
+      if (estadoB == LOW)
+        pulsos1++;
+      else
+        pulsos1--;
+    }
+    else
+    {
+      if (estadoB == HIGH)
+        pulsos1++;
+      else
+        pulsos1--;
+    }
+  }
+
+
+  if (estadoB != ultimoB1)
+  {
+    if (estadoB == HIGH)
+    {
+      if (estadoA == HIGH)
+        pulsos1++;
+      else
+        pulsos1--;
+    }
+    else
+    {
+      if (estadoA == LOW)
+        pulsos1++;
+      else
+        pulsos1--;
+    }
+  }
+
+
+  ultimoA1 = estadoA;
+  ultimoB1 = estadoB;
+}
+
+
+// =====================================================================
+// ENCODER MOTOR 2
+// =====================================================================
+
+void leerEncoder2()
+{
+  bool estadoA = digitalRead(pinA2);
+  bool estadoB = digitalRead(pinB2);
+
+
+  if (estadoA != ultimoA2)
+  {
+    if (estadoA == HIGH)
+    {
+      if (estadoB == LOW)
+        pulsos2++;
+      else
+        pulsos2--;
+    }
+    else
+    {
+      if (estadoB == HIGH)
+        pulsos2++;
+      else
+        pulsos2--;
+    }
+  }
+
+
+  if (estadoB != ultimoB2)
+  {
+    if (estadoB == HIGH)
+    {
+      if (estadoA == HIGH)
+        pulsos2++;
+      else
+        pulsos2--;
+    }
+    else
+    {
+      if (estadoA == LOW)
+        pulsos2++;
+      else
+        pulsos2--;
+    }
+  }
+
+
+  ultimoA2 = estadoA;
+  ultimoB2 = estadoB;
+}
+
+
+// =====================================================================
+// CALCULAR VELOCIDAD MOTOR 1
+// =====================================================================
+
+void calcularVelocidad1()
+{
+  noInterrupts();
+
+  long pulsosActual = pulsos1;
+
+  interrupts();
+
+
+  long deltaPulsos =
+    pulsosActual - pulsosAnterior1;
+
+
+  float deltaTime =
+    intervaloCalculo / 1000.0;
+
+
+  float velocidadRPM =
+    (deltaPulsos /
+    ((float)CPR * REDUCCION))
+    * (60.0 / deltaTime);
+
+
+  velocidadRPM1 = velocidadRPM;
+
+
+  pulsosAnterior1 = pulsosActual;
+}
+
+
+// =====================================================================
+// CALCULAR VELOCIDAD MOTOR 2
+// =====================================================================
+
+void calcularVelocidad2()
+{
+  noInterrupts();
+
+  long pulsosActual = pulsos2;
+
+  interrupts();
+
+
+  long deltaPulsos =
+    pulsosActual - pulsosAnterior2;
+
+
+  float deltaTime =
+    intervaloCalculo / 1000.0;
+
+
+  float velocidadRPM =
+    (deltaPulsos /
+    ((float)CPR * REDUCCION))
+    * (60.0 / deltaTime);
+
+
+  velocidadRPM2 = velocidadRPM;
+
+
+  pulsosAnterior2 = pulsosActual;
+}
